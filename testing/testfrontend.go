@@ -15,9 +15,10 @@ import (
 )
 
 type TestingStruct struct {
-	mu         sync.Mutex
-	kvServers  []int
-	numServers int
+	mu          sync.Mutex
+	kvServers   []int
+	numServers  int
+	portBlocked map[[2]int]bool
 }
 
 func ExecBashCommand(bash_cmd string) {
@@ -25,7 +26,7 @@ func ExecBashCommand(bash_cmd string) {
 	err := cmd.Start()
 
 	if err != nil {
-		fmt.Println("Failure!" + err.Error())
+		fmt.Printf("Failure! %v \n", err.Error())
 		return
 	}
 }
@@ -50,8 +51,8 @@ func (ts *TestingStruct) Put(key string, value string, clientId int) (string, bo
 	defer cancel()
 
 	putres, err := client.Put(ctx, putreq)
-	if err != nil {
-		fmt.Printf("could not put: %v \n", err)
+	if putres == nil || err != nil {
+		//fmt.Printf("could not put: %v \n", err)
 		return "", false
 	}
 	return putres.GetValue(), true
@@ -74,30 +75,39 @@ func (ts *TestingStruct) Get(key string, clientId int) (string, bool) {
 	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel2()
 	getres, err := client.Get(ctx2, getreq)
-	if err != nil {
-		fmt.Printf("could not get: %v \n", err)
+	if getres == nil || err != nil {
+		//fmt.Printf("could not get: %v \n", err)
 		return "", false
 	}
 	return getres.GetValue(), true
 
 }
 
-func (ts *TestingStruct) BlockPort(idx int) {
-	port_number := strconv.Itoa(9001 + idx)
-	cmd := "sudo iptables -I INPUT -p tcp --dport " + port_number + "-i lo -j DROP"
-	fmt.Println(cmd)
-	ExecBashCommand(cmd)
-	cmd = "sudo iptables -I OUTPUT -p tcp --dport " + port_number + "-i lo -j DROP"
-	ExecBashCommand(cmd)
+func (ts *TestingStruct) BlockPort(srcidx int, destidx int) {
+	dst_port_number := strconv.Itoa(9001 + destidx)
+	srcport := 7001 + ts.numServers*srcidx + destidx
+	src_port_number := strconv.Itoa(srcport)
+	value, exists := ts.portBlocked[[2]int{srcidx, destidx}]
+	if !exists || !value {
+		cmd := "sudo iptables -I INPUT -p tcp --dport " + dst_port_number + " --sport " + src_port_number + " -i lo -j DROP"
+		//fmt.Printf("%v \n", cmd)
+		ExecBashCommand(cmd)
+		ts.portBlocked[[2]int{srcidx, destidx}] = true
+	}
+
 }
 
-func (ts *TestingStruct) UnblockPort(idx int) {
-	port_number := strconv.Itoa(9001 + idx)
-	cmd := "sudo iptables -D INPUT -p tcp --dport " + port_number + "-i lo -j DROP"
-	fmt.Println(cmd)
-	ExecBashCommand(cmd)
-	cmd = "sudo iptables -D OUTPUT -p tcp --dport " + port_number + "-i lo -j DROP"
-	ExecBashCommand(cmd)
+func (ts *TestingStruct) UnBlockPort(srcidx int, destidx int) {
+	dst_port_number := strconv.Itoa(9001 + destidx)
+	srcport := 7001 + ts.numServers*srcidx + destidx
+	src_port_number := strconv.Itoa(srcport)
+	value, exists := ts.portBlocked[[2]int{srcidx, destidx}]
+	if exists && value {
+		cmd := "sudo iptables -D INPUT -p tcp --dport " + dst_port_number + " --sport " + src_port_number + " -i lo -j DROP"
+		//fmt.Printf("%v \n", cmd)
+		ExecBashCommand(cmd)
+		ts.portBlocked[[2]int{srcidx, destidx}] = false
+	}
 }
 
 func (ts *TestingStruct) GetLastLeader() (int, bool) {
@@ -145,7 +155,32 @@ func (ts *TestingStruct) GetLastLeader() (int, bool) {
 	}
 
 	return -1, true //no leader elected yet
+}
 
+func (ts *TestingStruct) GetStateOfServer(server int) (int, bool) {
+	conn, err := grpc.NewClient(fmt.Sprintf("localhost:%s", strconv.Itoa(server+9001)), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		fmt.Printf("did not connect: %v \n", err)
+		return -1, false
+	}
+	defer conn.Close()
+
+	client := pb.NewKeyValueStoreClient(conn)
+	req := &pb.Empty{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	res, err := client.GetState(ctx, req)
+	if err != nil {
+		fmt.Printf("could not get state: %v \n", err)
+		return -1, false
+	}
+
+	term := int(res.GetTerm())
+	isLeader := res.GetIsLeader()
+
+	return term, isLeader
 }
 
 func (ts *TestingStruct) StartRaft(numServers int) bool {
@@ -177,6 +212,7 @@ func (ts *TestingStruct) StartRaft(numServers int) bool {
 		ts.kvServers = append(ts.kvServers, 9001+i)
 	}
 	ts.numServers = numServers
+	ts.portBlocked = make(map[[2]int]bool)
 	return true
 
 }
@@ -188,7 +224,7 @@ func (ts *TestingStruct) KillAllServers() {
 		name := strconv.Itoa(i + 1)
 		app := "pkill -9 -f raftserver"
 		bash_cmd := app + name + " "
-		fmt.Println(bash_cmd)
+		//fmt.Println(bash_cmd)
 		wg.Add(1)
 		go func() {
 			cmd := exec.Command("bash", "-c", bash_cmd)
@@ -517,20 +553,175 @@ func (ts *TestingStruct) TestLinearizabilityWithKeyRangeDuplication() {
 	ts.testKVS(numKeys, numThreads, numRequests, putRatio, testConsistency, keyRangeDuplication, crashServer, addServer, removeServer)
 }
 
+func (ts *TestingStruct) DisconnectLeader() bool {
+	leader, ok := ts.GetLastLeader()
+	if !ok {
+		fmt.Println("DisconnectLeader: Failed to get leader")
+		return false
+	}
+	fmt.Printf("Leader before blocking ports is %v \n", leader)
+	for i := 0; i < ts.numServers; i++ {
+		if i != leader {
+			ts.BlockPort(leader, i)
+			ts.BlockPort(i, leader)
+		}
+	}
+	time.Sleep(1 * time.Second)
+	ts.Put("1", "6558", 1) //main thread
+	time.Sleep(1 * time.Second)
+	newleader, ok := ts.GetLastLeader()
+	if !ok {
+		fmt.Println("DisconnectLeader: Failed to get leader")
+		for i := 0; i < ts.numServers; i++ {
+			if i != leader {
+				ts.UnBlockPort(leader, i)
+				ts.UnBlockPort(i, leader)
+			}
+		}
+		return false
+	}
+	fmt.Printf("Leader after blocking ports is %v \n", newleader)
+	for i := 0; i < ts.numServers; i++ {
+		if i != leader {
+			ts.UnBlockPort(leader, i)
+			ts.UnBlockPort(i, leader)
+		}
+	}
+	val, ok := ts.Get("1", 1)
+	if !ok {
+		fmt.Println("DisconnectLeader: Failed to perform get operation")
+		return false
+	}
+	if val != "6558" {
+		fmt.Printf("Incorrect value received from leader!")
+		return false
+	}
+	return true
+}
+
+func (ts *TestingStruct) DisconnectMinority() bool {
+	nodes := ts.numServers
+	nodesToDisconnect := 0 //we want to disconnect a minority
+	if nodes%2 == 1 {      //odd
+		nodesToDisconnect = nodes / 2
+	} else { //even
+		nodesToDisconnect = (nodes / 2) - 1
+	}
+	//we disconnect two servers
+
+	for serverToDisconnect := 0; serverToDisconnect < nodesToDisconnect; serverToDisconnect++ {
+		for i := 0; i < ts.numServers; i++ {
+			if i != serverToDisconnect {
+				ts.BlockPort(serverToDisconnect, i)
+				ts.BlockPort(i, serverToDisconnect)
+			}
+		}
+	}
+
+	time.Sleep(1 * time.Second)
+	ts.Put("2", "6445", 1) //main thread
+	time.Sleep(1 * time.Second)
+
+	for serverToDisconnect := 0; serverToDisconnect < nodesToDisconnect; serverToDisconnect++ {
+		for i := 0; i < ts.numServers; i++ {
+			if i != serverToDisconnect {
+				ts.UnBlockPort(serverToDisconnect, i)
+				ts.UnBlockPort(i, serverToDisconnect)
+			}
+		}
+	}
+
+	val, ok := ts.Get("2", 1)
+	if !ok {
+		fmt.Println("DisconnectLeader: Failed to perform Get operation")
+		return false
+	}
+	if val != "6445" {
+		fmt.Printf("Incorrect value received from leader!")
+		return false
+	}
+	return true
+}
+func (ts *TestingStruct) DisconnectMajority() bool {
+
+	nodes := ts.numServers
+	nodesToDisconnect := 0 //we want to disconnect a majority
+	if nodes%2 == 1 {      //odd
+		nodesToDisconnect = nodes/2 + 1
+	} else { //even
+		nodesToDisconnect = (nodes / 2)
+	}
+	//we disconnect two servers
+	for serverToDisconnect := 0; serverToDisconnect < nodesToDisconnect; serverToDisconnect++ {
+		for i := 0; i < ts.numServers; i++ {
+			if i != serverToDisconnect {
+				ts.BlockPort(serverToDisconnect, i)
+				ts.BlockPort(i, serverToDisconnect)
+			}
+		}
+	}
+
+	time.Sleep(1 * time.Second)
+	_, ok := ts.Put("1", "2034", 1) //main thread
+	time.Sleep(1 * time.Second)
+	if ok {
+		fmt.Println("We made progress despite having a minority!")
+		for serverToDisconnect := 0; serverToDisconnect < nodesToDisconnect; serverToDisconnect++ {
+			for i := 0; i < ts.numServers; i++ {
+				if i != serverToDisconnect {
+					ts.UnBlockPort(serverToDisconnect, i)
+					ts.UnBlockPort(i, serverToDisconnect)
+				}
+			}
+		}
+		return false
+	}
+	for serverToDisconnect := 0; serverToDisconnect < nodesToDisconnect; serverToDisconnect++ {
+		for i := 0; i < ts.numServers; i++ {
+			if i != serverToDisconnect {
+				ts.UnBlockPort(serverToDisconnect, i)
+				ts.UnBlockPort(i, serverToDisconnect)
+			}
+		}
+	}
+	return true
+}
+
 func main() {
 	ts := TestingStruct{}
-	ok := ts.TestStartRaft(4)
+	defer ts.KillAllServers()
+	ok := ts.TestStartRaft(5)
 	if !ok {
 		fmt.Printf("Error while starting RAFT. \n")
 	}
-	ok = ts.TestKillLeader()
+	_, ok = ts.GetLastLeader()
+	if !ok {
+		fmt.Printf("Error while getting leader. \n")
+	}
+
+	ts.TestLinearizability()
+
+	ok = ts.DisconnectLeader()
+	if !ok {
+		fmt.Printf("Error while disconnecting leader. \n")
+	}
+
+	ok = ts.DisconnectMinority()
+	if !ok {
+		fmt.Printf("Error while disconnecting minority: Progress is still expected to be made. \n")
+	}
+	ok = ts.DisconnectMajority()
+	if !ok {
+		fmt.Printf("Error while disconnecting majority: No progress should be made. \n")
+	}
+	//ts.TestLinearizabilityWithKeyRangeDuplication()
+	//ts.TestOperations()
+
+	/*ok = ts.TestKillLeader()
 	if !ok {
 		fmt.Printf("Error while testing kill leader. \n")
 	}
-	ts.TestLinearizability()
-	ts.TestLinearizabilityWithKeyRangeDuplication()
-	ts.TestOperations()
-	ts.KillOneNode(2) //random node killed
+	//ts.KillOneNode(2) //random node killed
 	time.Sleep(1 * time.Second)
-	ts.TestLinearizability()
+	ts.TestLinearizability()*/
 }
